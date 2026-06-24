@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: congestion_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-congestion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-congestion_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-congestion_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-congestion} -d ${POSTGRES_DB:-congestion_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: congestion_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-congestion}:${POSTGRES_PASSWORD:-congestion_secret}@db:5432/${POSTGRES_DB:-congestion_db}
+      API_KEY_HASH: ${API_KEY_HASH:-}
+      MODEL_PATH: /app/ml_pipeline/models/congestion_model.pkl
+      RATE_LIMIT: ${RATE_LIMIT:-100/minute}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENV: ${ENV:-production}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./ml_pipeline/models:/app/ml_pipeline/models:ro
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: congestion_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

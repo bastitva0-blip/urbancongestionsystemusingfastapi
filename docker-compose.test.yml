@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  test_db:
+    image: postgis/postgis:16-3.4
+    container_name: congestion_test_db
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_secret
+      POSTGRES_DB: test_congestion
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_congestion"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    tmpfs:
+      - /var/lib/postgresql/data
