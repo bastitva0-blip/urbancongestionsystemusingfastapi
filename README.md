@@ -1,3 +1,4 @@
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge)](https://opensource.org/licenses/Apache-2.0)
 # Urban Congestion Prediction API
 
 A production-grade, asynchronous REST API that ingests real-time vehicle GPS telemetry, predicts urban traffic congestion via a pre-trained Scikit-Learn model, and asynchronously persists readings for continuous retraining loops.
