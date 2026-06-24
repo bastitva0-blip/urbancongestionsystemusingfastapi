@@ -1,10 +1,12 @@
 # Urban Congestion Prediction API
 
-A production-grade async REST API that ingests real-time vehicle GPS telemetry, predicts traffic congestion using a pre-trained Scikit-Learn model, and persists readings for continuous retraining.
+A production-grade, asynchronous REST API that ingests real-time vehicle GPS telemetry, predicts urban traffic congestion via a pre-trained Scikit-Learn model, and asynchronously persists readings for continuous retraining loops.
 
 ---
 
-## Architecture
+## 🏗️ System Architecture
+
+The service optimizes throughput by decoupling feature extraction and ML inference from the database persistence layer using FastAPI's `BackgroundTask`.
 
 ```
 [Vehicle / Simulation Client]
@@ -13,114 +15,127 @@ A production-grade async REST API that ingests real-time vehicle GPS telemetry, 
         ▼
 [FastAPI — auth (X-API-Key) + rate limit (slowapi)]
         │
-        ├─► PostGIS ST_Contains → zone lookup
+        ├─► PostGIS ST_Contains → Spatial zone lookup
         │
         ├─► Feature extraction: (hour, day_of_week, zone_id)
         │
-        ├─► GradientBoostingClassifier.predict_proba()   (loaded once at startup)
+        ├─► GradientBoostingClassifier.predict_proba() (Cached in memory)
         │
         ├─► Response: { congestion_probability, congestion_label, zone_id }
         │
         └─► BackgroundTask: async INSERT into traffic_history (partitioned)
+
 ```
 
-Key design points:
-- **Model loaded once** at startup via FastAPI lifespan; stored in `app.state.predictor`
-- **Graceful degradation**: if the model file is missing, the server still boots and `/predict` returns `503`
-- **Partitioned writes**: `traffic_history` uses native Postgres `PARTITION BY RANGE (reported_at)` — old months can be dropped without locking the parent table
-- **Zero blocking DB calls**: all ORM work goes through `asyncpg` + SQLAlchemy 2.0 async sessions
+### Key Design Patterns
+
+* **Singleton Model Lifecycle:** The Scikit-Learn model is loaded exactly once at startup via the FastAPI `lifespan` handler and stored globally in `app.state.predictor`.
+* **Graceful Degradation:** If the serialized model (`.pkl`) is corrupted or missing, the server still boots successfully; the `/predict` endpoint safely degrades to a `503 Service Unavailable` response.
+* **Partitioned Writes:** The `traffic_history` table uses native Postgres `PARTITION BY RANGE (reported_at)`. Historical months can be instantly unlinked or dropped without table-level locking.
+* **Non-Blocking I/O:** Every database operation leverages fully asynchronous execution paths via `asyncpg` and SQLAlchemy 2.0 async sessions.
 
 ---
 
-## Partitioning Strategy: Native Postgres vs TimescaleDB
+## 📊 Partitioning Strategy: Native Postgres vs. TimescaleDB
 
 | Criterion | Native Postgres RANGE | TimescaleDB Hypertable |
-|---|---|---|
-| Extensions needed | PostGIS only | PostGIS + TimescaleDB |
-| Docker image | `postgis/postgis` (official) | custom or `timescale/timescaledb-ha` |
-| Auto-partition creation | ❌ manual migration per month | ✅ automatic |
-| Partition dropping | `DROP TABLE traffic_history_YYYY_MM` — instant metadata op | `drop_chunks()` — same speed |
-| Compression | ❌ manual pg_partman needed | ✅ built-in columnar compression |
-| Retention policy | ❌ manual cron | ✅ `add_retention_policy()` |
-| Query planning | Standard Postgres planner | Transparent — planner-aware |
-| Managed cloud support | All Postgres providers | Timescale Cloud or self-host |
+| --- | --- | --- |
+| **Extensions Required** | PostGIS only | PostGIS + TimescaleDB |
+| **Docker Base Image** | `postgis/postgis` (Official) | Custom or `timescale/timescaledb-ha` |
+| **Auto-Partition Creation** | ❌ Manual/Scripted migration per month | ✅ Automatic chunks |
+| **Partition Dropping** | `DROP TABLE ...` (Instant metadata op) | `drop_chunks()` (Instant metadata op) |
+| **Compression** | ❌ Manual `pg_partman` needed | ✅ Built-in columnar compression |
+| **Retention Policy** | ❌ Manual cron / worker script | ✅ Built-in `add_retention_policy()` |
+| **Query Planning** | Standard Postgres planner | Transparent, chunk-aware planner |
+| **Cloud Managed Support** | Ubiquitous (RDS, Cloud SQL, Supabase) | Timescale Cloud or self-hosted |
 
-**Decision: native Postgres range partitioning.**
+### Rationale for Native Postgres Range Partitioning
 
-Rationale:
-1. Adding TimescaleDB would require a custom Docker image or a paid managed service — PostGIS is already the only extension dependency.
-2. At this data volume (millions of rows/month) manual partitioning is maintainable with a simple monthly migration.
-3. TimescaleDB's auto-compression and retention policies are compelling but can be layered on later by pointing the same schema at a TimescaleDB instance — the table structure is compatible.
-4. Accepted trade-off: a cron job or Alembic migration must create next month's partition before month rollover.
+1. **Minimized Dependency Footprint:** Adding TimescaleDB introduces custom image maintenance or specialized cloud hosting costs. PostGIS is already required for spatial lookups (`ST_Contains`).
+2. **Scale Alignment:** For mid-tier volumes (millions of rows/month), standard range partitions are highly performant and easily managed via monthly migration scripts.
+3. **Future-Proof Schema:** The schema layout remains 100% compatible with TimescaleDB. If volume scales drastically, tables can be migrated to hypertables transparently down the line.
 
 ---
 
-## Setup
+## 🚀 Getting Started
 
 ### Prerequisites
-- Docker 24+ and Docker Compose v2
-- Python 3.11+ (for local dev / training)
 
-### 1. Clone and configure
+* Docker 24+ and Docker Compose v2
+* Python 3.11+ (for local exploration/training)
+
+### 1. Environment Setup
+
+Clone the repository and instantiate your configuration file:
 
 ```bash
-git clone <repo>
+git clone <repo-url>
 cd urban-congestion-api
 cp .env.example .env
+
 ```
 
-Generate an API key and its hash:
+Generate a secure API key and its corresponding SHA-256 hash for your `.env`:
 
 ```bash
 python -c "
 import hashlib, secrets
 k = secrets.token_hex(32)
-print('API_KEY (put in X-API-Key header):', k)
-print('API_KEY_HASH (put in .env):', hashlib.sha256(k.encode()).hexdigest())
+print('API_KEY (Put in X-API-Key header):  ', k)
+print('API_KEY_HASH (Put in your .env):   ', hashlib.sha256(k.encode()).hexdigest())
 "
+
 ```
 
-Edit `.env` with your `API_KEY_HASH`.
+Paste the generated `API_KEY_HASH` value into your `.env` file.
 
-### 2. Train the model
+### 2. Train the Predictive Model
+
+Generate synthetic spatial data and train the initial `GradientBoostingClassifier`:
 
 ```bash
 pip install scikit-learn joblib numpy
 python -m ml_pipeline.train
+
 ```
 
-This writes `ml_pipeline/models/congestion_model.pkl` and `model_meta.json`.
+*This outputs `ml_pipeline/models/congestion_model.pkl` and `model_meta.json`.*
 
-### 3. Start the stack
+### 3. Spin Up the Infrastructure
+
+Build and run the primary containers:
 
 ```bash
-docker compose up --build
+docker compose up --build -d
+
 ```
 
-Services:
-| Service | URL |
-|---|---|
-| FastAPI | http://localhost:8000 |
-| Swagger UI | http://localhost:8000/docs |
-| Prometheus metrics | http://localhost:8000/metrics |
-| Prometheus server | http://localhost:9090 |
+| Component | Target URL |
+| --- | --- |
+| **FastAPI Core Engine** | [http://localhost:8000](http://localhost:8000) |
+| **Interactive OpenAPI/Swagger** | [http://localhost:8000/docs](http://localhost:8000/docs) |
+| **Prometheus Exporter** | [http://localhost:8000/metrics](http://localhost:8000/metrics) |
+| **Prometheus Dashboard** | [http://localhost:9090](http://localhost:9090) |
 
-### 4. Run migrations
+### 4. Execute Spatial Database Migrations
+
+Initialize your PostGIS geometry extensions, seed static zones, and create initial table partitions:
 
 ```bash
-# From inside the api container, or with DATABASE_URL set locally:
-alembic upgrade head
+docker compose exec api alembic upgrade head
+
 ```
 
 ---
 
-## API Usage
+## 📡 Core API Specification
 
-### Health check
+### Health Check
 
-```bash
-curl http://localhost:8000/health
-```
+Verify application readiness and dependency connectivity.
+
+* **Request:** `GET /health`
+* **Response (`200 OK`):**
 
 ```json
 {
@@ -129,9 +144,15 @@ curl http://localhost:8000/health
   "db_reachable": true,
   "version": "1.0.0"
 }
+
 ```
 
-### Predict congestion
+### Predict Congestion
+
+Ingests coordinate metrics and calculates current traffic probabilities.
+
+* **Request:** `POST /api/v1/traffic/predict`
+* **Headers:** `X-API-Key: <YOUR_API_KEY>`
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/traffic/predict \
@@ -140,9 +161,12 @@ curl -X POST http://localhost:8000/api/v1/traffic/predict \
   -d '{
     "lat": 40.7128,
     "lng": -74.0060,
-    "timestamp": "2024-08-17T08:30:00Z"
+    "timestamp": "2026-06-24T23:55:00Z"
   }'
+
 ```
+
+* **Response (`200 OK`):**
 
 ```json
 {
@@ -150,97 +174,103 @@ curl -X POST http://localhost:8000/api/v1/traffic/predict \
   "congestion_label": "high",
   "zone_id": 1,
   "zone_name": "downtown",
-  "model_version": "a3f9b1c2d4e5...",
-  "processed_at": "2024-08-17T08:30:01.234Z"
+  "model_version": "a3f9b1c2d4e5",
+  "processed_at": "2026-06-24T23:55:01.234Z"
 }
+
 ```
 
-**Labels:** `low` (< 0.4) · `medium` (0.4–0.7) · `high` (≥ 0.7)
-
-### List zones
-
-```bash
-curl http://localhost:8000/api/v1/traffic/zones \
-  -H "X-API-Key: YOUR_API_KEY"
-```
+> 💡 **Congestion Level Thresholds:** `low` ($< 0.4$) · `medium` ($0.4 \le p < 0.7$) · `high` ($\ge 0.7$)
 
 ---
 
-## Running Tests
+## 🧪 Testing Suite
+
+### Unit Tests
+
+Executed via mocked database sessions for instant continuous integration feedback:
 
 ```bash
 pip install -r requirements.txt
-pytest
+pytest tests/unit
+
 ```
 
-Tests mock the database session — no live Postgres required for the unit test suite.
+### Integration Tests
 
-For integration tests against a real PostGIS DB:
+Runs contract and database constraints against a live, ephemeral PostGIS instance:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
-DATABASE_URL=postgresql+asyncpg://test_user:test_secret@localhost:5433/test_congestion pytest
+DATABASE_URL=postgresql+asyncpg://test_user:test_secret@localhost:5433/test_congestion pytest tests/integration
+docker compose -f docker-compose.test.yml down
+
 ```
 
----
+### Load Testing
 
-## Load Testing
+Evaluate concurrency limits and endpoint saturation points via Locust:
 
 ```bash
 pip install locust
-locust -f locustfile.py --host http://localhost:8000 --users 200 --spawn-rate 20
+locust -f locustfile.py --host http://localhost:8000
+
 ```
 
-Open http://localhost:8089 for the Locust web UI.
-
-Headless run (60-second burst):
+Navigate to [http://localhost:8089](http://localhost:8089) for real-time graphs. Alternatively, execute a headless 60-second smoke test:
 
 ```bash
-locust -f locustfile.py --host http://localhost:8000 \
-       --users 200 --spawn-rate 20 --run-time 60s --headless
+locust -f locustfile.py --host http://localhost:8000 --users 200 --spawn-rate 20 --run-time 60s --headless
+
 ```
 
 ---
 
-## Database Partitions
+## 🛠️ Operations: Database Partition Management
 
-Monthly partitions are pre-created in the initial migration for a rolling 18-month window. To add a new month:
+Monthly partitions are pre-provisioned via the baseline Alembic migrations.
+
+### Manual Partition Additions
+
+To attach future timeline ranges before rollover occurrences:
 
 ```sql
-CREATE TABLE traffic_history_2025_07
+CREATE TABLE traffic_history_2026_07
   PARTITION OF traffic_history
-  FOR VALUES FROM ('2025-07-01') TO ('2025-08-01');
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
 ```
 
-To drop an old partition (instant, no lock on parent):
+### Pruning Historical Records
+
+To purge ancient metrics instantly without table locks or transaction-log bloating:
 
 ```sql
-DROP TABLE traffic_history_2024_01;
+DROP TABLE traffic_history_2025_01;
+
 ```
 
 ---
 
-## Project Structure
+## 📂 Project Anatomy
 
 ```
 urban-congestion-api/
 ├── src/
-│   ├── main.py                  # App init, lifespan (model load + cleanup)
+│   ├── main.py                  # Entrypoint: Configures lifespan hooks & global app state
 │   ├── api/
-│   │   ├── dependencies.py      # Auth, rate limit, DB session
-│   │   └── v1/traffic.py        # Predict + zones endpoints
-│   ├── core/config.py           # pydantic-settings typed config
-│   ├── db/{base,session}.py     # Async engine + session factory
-│   ├── models/{zone,telemetry}  # SQLAlchemy ORM models
-│   ├── schemas/traffic.py       # Pydantic request/response schemas
-│   └── services/predictor.py   # Model load, feature extraction, inference
+│   │   ├── dependencies.py      # Middleware: API key evaluation, rate limits, DB sessions
+│   │   └── v1/traffic.py        # Controllers: Inference and spatial retrieval routes
+│   ├── core/config.py           # Infrastructure: Pydantic-settings environment validation
+│   ├── db/                      # Persistence: Async connection pools & factories
+│   ├── models/                  # Declarative Layer: PostGIS/SQLAlchemy tables
+│   ├── schemas/traffic.py       # Validation: Strict request/response Pydantic schemas
+│   └── services/predictor.py    # ML Core: Thread-pooled inferences & feature extraction
 ├── ml_pipeline/
-│   ├── train.py                 # Synthetic data + GBClassifier training
-│   └── models/                 # congestion_model.pkl (gitignored)
-├── alembic/                    # Migrations (PostGIS, partitioned schema)
-├── tests/                      # pytest suite (unit + API contract)
-├── locustfile.py               # Load test
-├── docker-compose.yml
-├── Dockerfile
-└── .github/workflows/ci.yml    # Lint + test + Docker build on push
+│   ├── train.py                 # Routine: Pipeline generation & synthetic training runs
+│   └── models/                  # Artifact Store: Serialized .pkl files (Git ignored)
+├── alembic/                     # Migrations: DB schema iterations & initial partitions
+├── tests/                       # Validation Suite: Unit and integration paradigms
+└── .github/workflows/ci.yml     # Automation: Quality control linting & building pipelines
+
 ```
